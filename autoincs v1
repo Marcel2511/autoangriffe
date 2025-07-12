@@ -1,0 +1,289 @@
+// ==UserScript==
+// @name         Stämme-Angriff: Sekundengenau, Auto-Abschicken, Einheiten-Check, Eroberung mit 5er-Werten (Langsam, 1. Zeile einbezogen!)
+// @namespace    https://die-staemme.de/
+// @version      4.8
+// @description  Langsam & robust: Autoangriff/Unterstützung/Eroberung mit 5er-Logik (15er-Regel inkl. Angriff #1!), Timing, Truppenlimit, Eroberungs-Train, menschliches Verhalten
+// @author       Marcel Wollbaum
+// @match        https://*.die-staemme.de/game.php*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    if (!location.search.includes('screen=place')) return;
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const hasTiming = urlParams.has('ankunftsZeit');
+    const ankunftsZiel = hasTiming ? parseInt(urlParams.get('ankunftsZeit'), 10) : null;
+    const befehl = urlParams.get('befehl') || 'angriff';
+    const istAutoAngriff = urlParams.has('autoangriff') && urlParams.get('autoangriff') === "1";
+    const istEroberung = urlParams.has('eroberung');
+    const TIMEZONE_OFFSET_MS = 2 * 60 * 60 * 1000; // 2 Stunden
+
+    function toDateStr(ms) {
+        if (!ms || isNaN(ms)) return '-';
+        const d = new Date(ms);
+        return d.toLocaleDateString('de-DE') + ' ' + d.toLocaleTimeString('de-DE', { hour12: false });
+    }
+
+    function parseArrivalFromText() {
+        const arrivalTd = document.getElementById('date_arrival');
+        if (!arrivalTd) return null;
+        const txt = arrivalTd.textContent.trim();
+
+        let m = txt.match(/heute um\s*(\d{2}):(\d{2}):(\d{2})/i);
+        if (m) {
+            const jetzt = new Date();
+            const year = jetzt.getFullYear();
+            const month = jetzt.getMonth();
+            const day = jetzt.getDate();
+            const stunde = +m[1], minute = +m[2], sekunde = +m[3];
+            const d = new Date(year, month, day, stunde, minute, sekunde);
+            return d.getTime();
+        }
+
+        m = txt.match(/morgen um\s*(\d{2}):(\d{2}):(\d{2})/i);
+        if (m) {
+            const jetzt = new Date();
+            const year = jetzt.getFullYear();
+            const month = jetzt.getMonth();
+            const day = jetzt.getDate() + 1;
+            const stunde = +m[1], minute = +m[2], sekunde = +m[3];
+            const d = new Date(year, month, day, stunde, minute, sekunde);
+            return d.getTime();
+        }
+
+        m = txt.match(/(\d{2})\.(\d{2})\.(\d{4})\s*(\d{2}):(\d{2}):(\d{2})/);
+        if (m) {
+            const d = new Date(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +m[6]);
+            return d.getTime();
+        }
+
+        return null;
+    }
+
+    function patchFormAction(btn) {
+        setTimeout(() => {
+            let form = btn ? btn.form : null;
+            if (!form) return;
+            let paramsToTransfer = [];
+            const allFlags = [];
+            if (urlParams.has('autoangriff')) allFlags.push('autoangriff');
+            if (urlParams.has('ankunftsZeit')) allFlags.push('ankunftsZeit');
+            if (urlParams.has('befehl')) allFlags.push('befehl');
+            if (urlParams.has('eroberung')) allFlags.push('eroberung');
+            allFlags.forEach(flag => {
+                if (urlParams.has(flag) && !form.action.includes(flag + '=')) {
+                    paramsToTransfer.push(flag + '=' + encodeURIComponent(urlParams.get(flag)));
+                }
+            });
+            if (paramsToTransfer.length > 0) {
+                form.action += (form.action.includes('?') ? '&' : '?') + paramsToTransfer.join('&');
+                console.log('[AutoAngriff] Patch Form-Action:', form.action);
+            }
+        }, 200);
+    }
+
+    // Korrektur der Einheitenfelder im ersten Screen
+    function checkUnitsAvailableAndCorrect(callback) {
+        setTimeout(() => {
+            document.querySelectorAll('input.unitsInput[data-all-count]').forEach(inp => {
+                const max = parseInt(inp.getAttribute('data-all-count'), 10) || 0;
+                const val = parseInt(inp.value, 10) || 0;
+                if (val > max) {
+                    console.log(`[AutoAngriff] Korrigiere ${inp.name}: ${val} → ${max}`);
+                    inp.value = max;
+                }
+            });
+            if (typeof callback === "function") callback();
+        }, 350);
+    }
+
+    // Die neue, richtige 15er/5er-Logik für Eroberung (erste Zeile zählt!)
+    function fuelleTrainZeilenMitFuenfern(callback) {
+        setTimeout(() => {
+            // 1. Bereits vergebene aus erster .units-row (die nicht editierbare, Angriff #1):
+            let firstRow = document.querySelector('tr.units-row');
+            let alreadyUsed = {};
+            if (firstRow) {
+                Array.from(firstRow.querySelectorAll('td.unit-item')).forEach(td => {
+                    const typ = (td.className.match(/unit-item-([a-z]+)/)||[])[1];
+                    if (typ) alreadyUsed[typ] = parseInt(td.textContent.trim(), 10) || 0;
+                });
+            }
+
+            // 2. Verfügbarer Bestand (aus .train-ui)
+            let bestandsZeile = document.querySelector('tr.train-ui');
+            let bestand = {};
+            if (bestandsZeile) {
+                Array.from(bestandsZeile.querySelectorAll('td.unit-item')).forEach(td => {
+                    const typ = (td.className.match(/unit-item-([a-z]+)/)||[])[1];
+                    if (typ) bestand[typ] = parseInt(td.getAttribute('data-unit-count'), 10) || 0;
+                });
+            }
+
+            // 3. Alle weiteren units-row mit Inputs (Angriff #2-4)
+            let angZl = Array.from(document.querySelectorAll('tr.units-row')).filter(
+                (tr, i) => i > 0 && tr.querySelector('input[type="number"][data-unit]')
+            );
+
+            // „used“ merkt sich alle vergebenen (inkl. erste Zeile)
+            let used = {...alreadyUsed};
+
+            angZl.forEach(row => {
+                row.querySelectorAll('input[type="number"][data-unit]').forEach(inp => {
+                    const typ = inp.getAttribute('data-unit');
+                    if (typ === "snob") return; // snob bleibt!
+                    // Wie viele bereits insgesamt vergeben (inkl. #1)?
+                    const insgesamtVergeben = (used[typ] || 0);
+                    const nochImBestand = (bestand[typ] || 0) - insgesamtVergeben;
+                    // 5 eintragen, falls insgesamt mind. 15 & für diese Zeile 5 übrig:
+                    if ((bestand[typ] || 0) >= 15 && nochImBestand >= 5) {
+                        inp.value = 5;
+                        used[typ] = (used[typ] || 0) + 5;
+                    } else {
+                        inp.value = ""; // leer lassen
+                    }
+                });
+            });
+            if (typeof callback === "function") setTimeout(callback, 500);
+        }, 300);
+    }
+
+    function handleEroberungTrainClicks(doneCallback) {
+        let trainBtn = document.getElementById('troop_confirm_train');
+        let clickCount = 0;
+        function clicker() {
+            if (!trainBtn || clickCount >= 3) {
+                fuelleTrainZeilenMitFuenfern(doneCallback);
+                return;
+            }
+            trainBtn.click();
+            clickCount++;
+            setTimeout(() => {
+                trainBtn = document.getElementById('troop_confirm_train');
+                clicker();
+            }, 600);
+        }
+        clicker();
+    }
+
+    function abschickenMitRetry(versuche = 0) {
+        const isConfirmScreen = location.search.includes('try=confirm');
+
+        // 1. Erster Screen: Korrigieren, dann Button klicken
+        if (!isConfirmScreen) {
+            checkUnitsAvailableAndCorrect(() => {
+                let attackBtn = document.querySelector('input[type="submit"][name="attack"][value="Angreifen"]');
+                let supportBtn = document.querySelector('input[type="submit"][name="support"][value="Unterstützen"]');
+                if (attackBtn) patchFormAction(attackBtn);
+                if (supportBtn) patchFormAction(supportBtn);
+
+                setTimeout(() => {
+                    if (istAutoAngriff) {
+                        if (befehl === "unterstuetzung" && supportBtn) {
+                            console.log('[AutoAngriff] autoangriff=1, klicke Unterstützen-Button.');
+                            supportBtn.click();
+                        }
+                        if (befehl === "angriff" && attackBtn) {
+                            console.log('[AutoAngriff] autoangriff=1, klicke Angreifen-Button.');
+                            attackBtn.click();
+                        }
+                    }
+                }, 400);
+            });
+            return;
+        }
+
+        // 2. Confirm-Screen: Eroberung, Timing, AutoAngriff
+        let confirmAttack = document.querySelector('input[type="submit"][name="submit_confirm"][value="Angreifen"]');
+        let confirmSupport = document.querySelector('input[type="submit"][name="submit_confirm"][value="Unterstützung schicken"]');
+
+        function waitForArrivalAndClick(btn, typ) {
+            if (!ankunftsZiel) {
+                if (istAutoAngriff) {
+                    setTimeout(() => {
+                        console.log('[AutoAngriff] (Confirm) Kein Timing-Ziel angegeben, klicke sofort ('+typ+')!');
+                        btn.click();
+                    }, 500);
+                } else {
+                    console.log('[AutoAngriff] (Confirm) Kein autoangriff=1 – NICHT klicken!');
+                }
+                return;
+            }
+            function waitLoop() {
+                const actualArrival = parseArrivalFromText();
+                if (!actualArrival) {
+                    setTimeout(waitLoop, 600);
+                    return;
+                }
+                const zielSek = Math.floor((ankunftsZiel - TIMEZONE_OFFSET_MS) / 1000);
+                const arrivalSek = Math.floor(actualArrival / 1000);
+                console.log(`[AutoAngriff][Warten] (${typ}) Angezeigt: ${arrivalSek} (${toDateStr(actualArrival)}) | Ziel: ${zielSek} (${toDateStr(ankunftsZiel - TIMEZONE_OFFSET_MS)})`);
+                if (arrivalSek === zielSek) {
+                    if (istAutoAngriff) {
+                        setTimeout(() => {
+                            console.log('[AutoAngriff] Zielsekunde erreicht, klicke ' + typ + '!');
+                            btn.click();
+                        }, 450);
+                    } else {
+                        console.log('[AutoAngriff] Zielsekunde erreicht, aber autoangriff=1 fehlt – NICHT klicken!');
+                    }
+                    return;
+                }
+                if (arrivalSek < zielSek) {
+                    setTimeout(waitLoop, 600);
+                } else {
+                    if (istAutoAngriff) {
+                        setTimeout(() => {
+                            console.log('[AutoAngriff] Zielsekunde überschritten, klicke sofort ' + typ + '!');
+                            btn.click();
+                        }, 400);
+                    } else {
+                        console.log('[AutoAngriff] Zielsekunde überschritten, aber autoangriff=1 fehlt – NICHT klicken!');
+                    }
+                }
+            }
+            waitLoop();
+        }
+
+        // ==== EROBERUNG ====
+        if (istEroberung) {
+            handleEroberungTrainClicks(() => {
+                setTimeout(() => {
+                    // Nach dem Füllen: sekundengenau abklicken!
+                    if (confirmAttack) {
+                        waitForArrivalAndClick(confirmAttack, "Angriff (Eroberung)");
+                    } else {
+                        abschickenMitRetry(versuche + 1);
+                    }
+                }, 600);
+            });
+            return;
+        }
+
+        // ==== NORMAL ====
+        if (befehl === 'unterstuetzung' && confirmSupport) {
+            waitForArrivalAndClick(confirmSupport, "Unterstützung");
+            return;
+        }
+        if (befehl === 'angriff' && confirmAttack) {
+            waitForArrivalAndClick(confirmAttack, "Angriff");
+            return;
+        }
+
+        // Retry-Logik für dynamische Ladezeiten
+        if (versuche < 20) {
+            setTimeout(() => abschickenMitRetry(versuche + 1), 120);
+            if (versuche === 0) console.log('[AutoAngriff] Warte auf Bestätigungs-Button...');
+        } else {
+            console.log('[AutoAngriff] Kein Bestätigungs-Button gefunden (Timeout nach 2,5s).');
+        }
+    }
+
+    window.addEventListener('load', function() {
+        abschickenMitRetry();
+    });
+
+})();
